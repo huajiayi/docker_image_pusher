@@ -2,3 +2,4 @@ qdrant/qdrant:v1.9.4
 pgvector/pgvector:pg16
 eclipse-temurin:11
 rabbitmq:3-management
+nginx:latest
