@@ -3,3 +3,4 @@ pgvector/pgvector:pg16
 eclipse-temurin:11
 rabbitmq:3-management
 nginx:latest
+semitechnologies/weaviate:1.25.4
