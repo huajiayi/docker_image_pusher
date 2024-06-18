@@ -4,3 +4,8 @@ eclipse-temurin:11
 rabbitmq:3-management
 nginx:latest
 semitechnologies/weaviate:1.25.4
+mysql:5.7
+neo4j:4.4.30-enterprise
+mongo:6.0.13
+elasticsearch:7.17.1
+kibana:7.17.1
