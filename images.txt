@@ -10,4 +10,4 @@ mongo:6.0.13
 elasticsearch:7.17.1
 kibana:7.17.1
 ghcr.io/schneiderelectricbuildings/ebo-enterprise-server:6.0.3.112
-sonarqube:latest
+sonarqube:9.9.6-community
