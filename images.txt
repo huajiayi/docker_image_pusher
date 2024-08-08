@@ -11,3 +11,4 @@ elasticsearch:7.17.1
 kibana:7.17.1
 ghcr.io/schneiderelectricbuildings/ebo-enterprise-server:6.0.3.112
 sonarqube:9.9.6-community
+bitnami/minio:2024.8.3
