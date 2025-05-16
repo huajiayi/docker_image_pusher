@@ -1,1 +1,1 @@
-eclipse-temurin:17
+docker.n8n.io/n8nio/n8n
