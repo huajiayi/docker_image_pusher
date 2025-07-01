@@ -1,3 +1,1 @@
-simpleyyt/manus-frontend
-simpleyyt/manus-backend
-simpleyyt/manus-sandbox
+mysql:8
