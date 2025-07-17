@@ -1,1 +1,1 @@
-dbeaver/cloudbeaver:latest
+casbin/casdoor:latest
