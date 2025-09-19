@@ -1,1 +1,1 @@
-casbin/casdoor:latest
+eclipse-temurin:17
