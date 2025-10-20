@@ -1,4 +1,4 @@
-name: Mirror images to Aliyun Registry
+name: Mirror images to Aliyun (flatten library/)
 
 on:
   workflow_dispatch:
@@ -6,22 +6,23 @@ on:
     branches: [ main ]
 
 env:
-  # 这些有值时会被脚本使用（均通过 GitHub Secrets 注入）
   ALIYUN_REGISTRY: "${{ secrets.ALIYUN_REGISTRY }}"          # e.g. registry.cn-hangzhou.aliyuncs.com
-  ALIYUN_NAME_SPACE: "${{ secrets.ALIYUN_NAME_SPACE }}"      # 你的命名空间 / 仓库前缀
+  ALIYUN_NAME_SPACE: "${{ secrets.ALIYUN_NAME_SPACE }}"      # 目标命名空间
   ALIYUN_REGISTRY_USER: "${{ secrets.ALIYUN_REGISTRY_USER }}"
   ALIYUN_REGISTRY_PASSWORD: "${{ secrets.ALIYUN_REGISTRY_PASSWORD }}"
-  # Docker Hub (可选) - 如果不设置，使用匿名拉取（可能受 rate limit）
-  DOCKERHUB_USER: "${{ secrets.DOCKERHUB_USER }}"
-  DOCKERHUB_PASSWORD: "${{ secrets.DOCKERHUB_PASSWORD }}"
+  DOCKERHUB_USER: "${{ secrets.DOCKERHUB_USER }}"            # optional
+  DOCKERHUB_PASSWORD: "${{ secrets.DOCKERHUB_PASSWORD }}"    # optional
+  # 行为控制：
+  # 如果为 "true" 则在目标已存在时覆盖（默认 skip）
+  OVERWRITE: "false"
 
 jobs:
   mirror:
-    name: Mirror images from images.txt -> Aliyun
+    name: Mirror (flatten library/)
     runs-on: ubuntu-latest
     timeout-minutes: 120
     steps:
-      - name: Checkout
+      - name: Checkout repo
         uses: actions/checkout@v4
 
       - name: Install skopeo and jq
@@ -30,51 +31,42 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y skopeo jq
 
-      - name: Show environment (for debug)
-        run: |
-          echo "ALIYUN_REGISTRY=${ALIYUN_REGISTRY}"
-          echo "ALIYUN_NAME_SPACE=${ALIYUN_NAME_SPACE}"
-          # DO NOT echo secrets such as passwords
-
-      - name: Mirror images listed in images.txt
+      - name: Mirror images with library/ flattened
         run: |
           set -eo pipefail
           IFS=$'\n'
 
-          # Helper: trim whitespace
           trim() {
             local var="$*"
-            # remove leading/trailing whitespace
             var="${var#"${var%%[![:space:]]*}"}"
             var="${var%"${var##*[![:space:]]}"}"
             printf '%s' "$var"
           }
 
-          # Validate required env
           if [ -z "${ALIYUN_REGISTRY:-}" ] || [ -z "${ALIYUN_NAME_SPACE:-}" ] || [ -z "${ALIYUN_REGISTRY_USER:-}" ] || [ -z "${ALIYUN_REGISTRY_PASSWORD:-}" ]; then
-            echo "ERROR: ALIYUN_REGISTRY, ALIYUN_NAME_SPACE, ALIYUN_REGISTRY_USER, ALIYUN_REGISTRY_PASSWORD must be set in secrets."
+            echo "ERROR: 必需的 secrets (ALIYUN_REGISTRY, ALIYUN_NAME_SPACE, ALIYUN_REGISTRY_USER, ALIYUN_REGISTRY_PASSWORD) 未配置。"
             exit 1
           fi
 
-          # Optional src creds
           if [ -n "${DOCKERHUB_USER:-}" ] && [ -n "${DOCKERHUB_PASSWORD:-}" ]; then
             SRC_CREDS="--src-creds=${DOCKERHUB_USER}:${DOCKERHUB_PASSWORD}"
             echo "Using Docker Hub credentials for source."
           else
             SRC_CREDS=""
-            echo "No Docker Hub credentials provided — will use anonymous pulls (may hit rate limits)."
+            echo "No Docker Hub credentials provided — anonymous pulls (may hit rate limits)."
           fi
           DEST_CREDS="--dest-creds=${ALIYUN_REGISTRY_USER}:${ALIYUN_REGISTRY_PASSWORD}"
 
-          # Read images.txt
           if [ ! -f images.txt ]; then
-            echo "ERROR: images.txt not found in repo root. Create it with one image per line."
+            echo "ERROR: images.txt not found in repo root."
             exit 1
           fi
 
+          report_success=()
+          report_failed=()
           n=0
+
           while IFS= read -r raw || [ -n "$raw" ]; do
-            # strip comments after '#' and trim
             line="${raw%%#*}"
             line=$(trim "$line")
             [ -z "$line" ] && continue
@@ -82,20 +74,15 @@ jobs:
             n=$((n+1))
             echo "---- [$n] Processing: $line ----"
 
-            # Normalize source image:
-            # If user supplies 'nginx:1.21' or 'library/nginx:1.21' -> treat as docker.io/library/nginx:1.21
             src="$line"
-            # if it contains "://" assume full schema provided
+            # Normalize source into skopeo style docker://...
             if [[ "$src" == *"://"* ]]; then
               src_ref="$src"
             else
-              # If first path segment looks like a hostname (contains '.' or ':' or 'localhost'), keep it
               firstseg="${src%%/*}"
               if [[ "$firstseg" == *.* || "$firstseg" == *:* || "$firstseg" == "localhost" ]]; then
-                # full-qualified, e.g., registry.example.com/foo/bar:tag
                 src_ref="docker://$src"
               else
-                # not hostname -> assume docker.io. For single name like "nginx:tag" use library prefix if no slash
                 if [[ "$src" != */* ]]; then
                   src="library/$src"
                 fi
@@ -103,12 +90,8 @@ jobs:
               fi
             fi
 
-            # compute destination path: strip registry if present from src, keep path and tag
-            # extract pathAfterRegistry: remove the leading "docker://<registry>/" if exists, else use $src after possible docker.io prefix handled above
-            # Re-use $src (which might be prefixed with docker.io/...) to compute path part
-            # remove potential schema
+            # compute path_after_registry (原始 path 与 tag)
             no_schema="${src_ref#docker://}"
-            # if it has a registry host (contains '.' or ':' before first '/'), remove it
             firstseg="${no_schema%%/*}"
             if [[ "$firstseg" == *.* || "$firstseg" == *:* || "$firstseg" == "localhost" ]]; then
               path_after_registry="${no_schema#*/}"
@@ -116,35 +99,70 @@ jobs:
               path_after_registry="$no_schema"
             fi
 
-            dest_ref="docker://${ALIYUN_REGISTRY}/${ALIYUN_NAME_SPACE}/${path_after_registry}"
+            # ---------------------------
+            # 扁平化规则：去掉开头的 library/ 前缀（仅开头）
+            # ---------------------------
+            if [[ "$path_after_registry" == library/* ]]; then
+              path_after_registry="${path_after_registry#library/}"
+              echo "Flattened path (removed leading library/): $path_after_registry"
+            fi
+
+            dest_short="${ALIYUN_REGISTRY}/${ALIYUN_NAME_SPACE}/${path_after_registry}"
+            dest_ref="docker://${dest_short}"
 
             echo "SRC:  $src_ref"
             echo "DEST: $dest_ref"
 
-            # Retry logic (3 attempts)
+            # 检查目标是否已存在（skopeo inspect 返回 0 表示存在）
+            dest_exists=false
+            if skopeo inspect ${DEST_CREDS} "$dest_ref" > /dev/null 2>&1; then
+              dest_exists=true
+            fi
+
+            if $dest_exists && [ "${OVERWRITE:-false}" != "true" ]; then
+              echo "WARNING: target already exists and OVERWRITE!=true — skipping: $dest_short"
+              report_failed+=("$src_ref -> SKIPPED_EXISTS -> $dest_short")
+              continue
+            fi
+
+            # Retry logic
             attempt=0
             max_attempts=3
-            until [ $attempt -ge $max_attempts ]
-            do
+            success=false
+            until [ $attempt -ge $max_attempts ]; do
               attempt=$((attempt+1))
               echo "Attempt $attempt for $src_ref -> $dest_ref"
-              # skopeo copy --all preserves manifest lists and all archs
               if skopeo copy --all ${SRC_CREDS} ${DEST_CREDS} "$src_ref" "$dest_ref"; then
-                echo "Successfully copied $src -> ${ALIYUN_REGISTRY}/${ALIYUN_NAME_SPACE}/${path_after_registry}"
+                echo "Copied: $src_ref -> $dest_short"
+                success=true
+                report_success+=("$src_ref -> $dest_short")
                 break
               else
                 echo "skopeo copy failed on attempt $attempt for $src_ref"
-                sleep $((attempt*5))
+                sleep $((attempt * 5))
               fi
             done
 
-            if [ $attempt -ge $max_attempts ]; then
+            if ! $success; then
               echo "ERROR: failed to copy $src_ref after $max_attempts attempts"
-              # choose whether to exit or continue. We will continue but mark failure.
-              echo "Continuing to next image (check logs)."
+              report_failed+=("$src_ref -> FAILED -> $dest_short")
             fi
 
             echo "---- done $n ----"
           done < images.txt
 
-          echo "All lines processed."
+          echo
+          echo "====== SUMMARY ======"
+          echo "Succeeded: ${#report_success[@]}"
+          for item in "${report_success[@]}"; do echo "  + $item"; done
+          echo "Skipped/Failed: ${#report_failed[@]}"
+          for item in "${report_failed[@]}"; do echo "  - $item"; done
+
+          # if any failures, exit with non-zero (可根据策略修改)
+          if [ "${#report_failed[@]}" -gt 0 ]; then
+            echo "Some images were skipped/failed. Check logs."
+            # 不直接失败整个 job（取决于策略），这里选择返回非0让 CI 显示失败，便于你注意
+            exit 2
+          fi
+
+          echo "All done."
