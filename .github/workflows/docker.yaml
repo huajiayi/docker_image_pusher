@@ -1,99 +1,150 @@
-name: Docker
+name: Mirror images to Aliyun Registry
 
 on:
   workflow_dispatch:
   push:
     branches: [ main ]
 
-
 env:
-  ALIYUN_REGISTRY: "${{ secrets.ALIYUN_REGISTRY }}"
-  ALIYUN_NAME_SPACE: "${{ secrets.ALIYUN_NAME_SPACE }}"
+  # 这些有值时会被脚本使用（均通过 GitHub Secrets 注入）
+  ALIYUN_REGISTRY: "${{ secrets.ALIYUN_REGISTRY }}"          # e.g. registry.cn-hangzhou.aliyuncs.com
+  ALIYUN_NAME_SPACE: "${{ secrets.ALIYUN_NAME_SPACE }}"      # 你的命名空间 / 仓库前缀
   ALIYUN_REGISTRY_USER: "${{ secrets.ALIYUN_REGISTRY_USER }}"
   ALIYUN_REGISTRY_PASSWORD: "${{ secrets.ALIYUN_REGISTRY_PASSWORD }}"
+  # Docker Hub (可选) - 如果不设置，使用匿名拉取（可能受 rate limit）
+  DOCKERHUB_USER: "${{ secrets.DOCKERHUB_USER }}"
+  DOCKERHUB_PASSWORD: "${{ secrets.DOCKERHUB_PASSWORD }}"
 
 jobs:
-
-  build:
-    name: Pull
+  mirror:
+    name: Mirror images from images.txt -> Aliyun
     runs-on: ubuntu-latest
+    timeout-minutes: 120
     steps:
-    - name: Docker Setup Buildx
-      uses: docker/setup-buildx-action@v3
+      - name: Checkout
+        uses: actions/checkout@v4
 
-    - name: Checkout Code
-      uses: actions/checkout@v4
+      - name: Install skopeo and jq
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y skopeo jq
 
-    - name: Build and push image Aliyun
-      run: |
-        docker login -u $ALIYUN_REGISTRY_USER -p $ALIYUN_REGISTRY_PASSWORD $ALIYUN_REGISTRY
-        # 数据预处理,判断镜像是否重名
-        declare -A duplicate_images
-        declare -A temp_map
-        while IFS= read -r line; do
-            [[ -z "$line" ]] && continue
-            # 获取镜像的完整名称，例如kasmweb/nginx:1.25.3（命名空间/镜像名:版本号）
-            image=$(echo "$line" | awk '{print $NF}')
-            echo "image $image"
-            # 获取镜像名:版本号  例如nginx:1.25.3
-            image_name_tag=$(echo "$image" | awk -F'/' '{print $NF}')
-            echo "image_name_tag $image_name_tag"
-            # 获取命名空间
-            name_space=$(echo "$image" | awk -F'/' '{if (NF>1) print $1}'| awk '{print $1}')
-            echo "name_space: $name_space"
-            # 这里不要是空值影响判断
-            name_space="${name_space}_"
-            # 获取镜像名例如nginx
-            image_name=$(echo "$image_name_tag" | awk -F':' '{print $1}')
-            
-            # 如果镜像存在于数组中，则添加temp_map
-            if [[ -n "${temp_map[$image_name]}" ]]; then
-                 # 如果temp_map已经存在镜像名，判断是不是同一命名空间
-                 if [[ "${temp_map[$image_name]}" != $name_space  ]]; then
-                    echo "duplicate image name: $image_name"
-                    duplicate_images[$image_name]="true"
-                 fi
+      - name: Show environment (for debug)
+        run: |
+          echo "ALIYUN_REGISTRY=${ALIYUN_REGISTRY}"
+          echo "ALIYUN_NAME_SPACE=${ALIYUN_NAME_SPACE}"
+          # DO NOT echo secrets such as passwords
+
+      - name: Mirror images listed in images.txt
+        run: |
+          set -eo pipefail
+          IFS=$'\n'
+
+          # Helper: trim whitespace
+          trim() {
+            local var="$*"
+            # remove leading/trailing whitespace
+            var="${var#"${var%%[![:space:]]*}"}"
+            var="${var%"${var##*[![:space:]]}"}"
+            printf '%s' "$var"
+          }
+
+          # Validate required env
+          if [ -z "${ALIYUN_REGISTRY:-}" ] || [ -z "${ALIYUN_NAME_SPACE:-}" ] || [ -z "${ALIYUN_REGISTRY_USER:-}" ] || [ -z "${ALIYUN_REGISTRY_PASSWORD:-}" ]; then
+            echo "ERROR: ALIYUN_REGISTRY, ALIYUN_NAME_SPACE, ALIYUN_REGISTRY_USER, ALIYUN_REGISTRY_PASSWORD must be set in secrets."
+            exit 1
+          fi
+
+          # Optional src creds
+          if [ -n "${DOCKERHUB_USER:-}" ] && [ -n "${DOCKERHUB_PASSWORD:-}" ]; then
+            SRC_CREDS="--src-creds=${DOCKERHUB_USER}:${DOCKERHUB_PASSWORD}"
+            echo "Using Docker Hub credentials for source."
+          else
+            SRC_CREDS=""
+            echo "No Docker Hub credentials provided — will use anonymous pulls (may hit rate limits)."
+          fi
+          DEST_CREDS="--dest-creds=${ALIYUN_REGISTRY_USER}:${ALIYUN_REGISTRY_PASSWORD}"
+
+          # Read images.txt
+          if [ ! -f images.txt ]; then
+            echo "ERROR: images.txt not found in repo root. Create it with one image per line."
+            exit 1
+          fi
+
+          n=0
+          while IFS= read -r raw || [ -n "$raw" ]; do
+            # strip comments after '#' and trim
+            line="${raw%%#*}"
+            line=$(trim "$line")
+            [ -z "$line" ] && continue
+
+            n=$((n+1))
+            echo "---- [$n] Processing: $line ----"
+
+            # Normalize source image:
+            # If user supplies 'nginx:1.21' or 'library/nginx:1.21' -> treat as docker.io/library/nginx:1.21
+            src="$line"
+            # if it contains "://" assume full schema provided
+            if [[ "$src" == *"://"* ]]; then
+              src_ref="$src"
             else
-                # 存镜像的命名空间
-                temp_map[$image_name]=$name_space
-            fi       
-        done < images.txt
-        
-        
-        while IFS= read -r line; do
-            [[ -z "$line" ]] && continue
-            echo "docker pull $line"
-            docker pull $line
-            platform=$(echo "$line" | awk -F'--platform[ =]' '{if (NF>1) print $2}' | awk '{print $1}')
-            echo "platform is $platform"
-            # 如果存在架构信息 将架构信息拼到镜像名称前面
-            if [ -z "$platform" ]; then
-                platform_prefix=""
+              # If first path segment looks like a hostname (contains '.' or ':' or 'localhost'), keep it
+              firstseg="${src%%/*}"
+              if [[ "$firstseg" == *.* || "$firstseg" == *:* || "$firstseg" == "localhost" ]]; then
+                # full-qualified, e.g., registry.example.com/foo/bar:tag
+                src_ref="docker://$src"
+              else
+                # not hostname -> assume docker.io. For single name like "nginx:tag" use library prefix if no slash
+                if [[ "$src" != */* ]]; then
+                  src="library/$src"
+                fi
+                src_ref="docker://docker.io/$src"
+              fi
+            fi
+
+            # compute destination path: strip registry if present from src, keep path and tag
+            # extract pathAfterRegistry: remove the leading "docker://<registry>/" if exists, else use $src after possible docker.io prefix handled above
+            # Re-use $src (which might be prefixed with docker.io/...) to compute path part
+            # remove potential schema
+            no_schema="${src_ref#docker://}"
+            # if it has a registry host (contains '.' or ':' before first '/'), remove it
+            firstseg="${no_schema%%/*}"
+            if [[ "$firstseg" == *.* || "$firstseg" == *:* || "$firstseg" == "localhost" ]]; then
+              path_after_registry="${no_schema#*/}"
             else
-                platform_prefix="${platform//\//_}_"
+              path_after_registry="$no_schema"
             fi
-            echo "platform_prefix is $platform_prefix"
-            # 获取镜像的完整名称，例如kasmweb/nginx:1.25.3（命名空间/镜像名:版本号）
-            image=$(echo "$line" | awk '{print $NF}')
-            # 获取 镜像名:版本号  例如nginx:1.25.3
-            image_name_tag=$(echo "$image" | awk -F'/' '{print $NF}')
-            # 获取命名空间  例如kasmweb
-            name_space=$(echo "$image" | awk -F'/' '{if (NF>1) print $1}'| awk '{print $1}')
-            # 获取镜像名例  例如nginx
-            image_name=$(echo "$image_name_tag" | awk -F':' '{print $1}')
-        
-            name_space_prefix=""
-            # 如果镜像名重名
-            if [[ -n "${duplicate_images[$image_name]}" ]]; then
-               #如果命名空间非空，将命名空间加到前缀
-               if [[ -n "${name_space}" ]]; then
-                  name_space_prefix="${name_space}_"
-               fi
+
+            dest_ref="docker://${ALIYUN_REGISTRY}/${ALIYUN_NAME_SPACE}/${path_after_registry}"
+
+            echo "SRC:  $src_ref"
+            echo "DEST: $dest_ref"
+
+            # Retry logic (3 attempts)
+            attempt=0
+            max_attempts=3
+            until [ $attempt -ge $max_attempts ]
+            do
+              attempt=$((attempt+1))
+              echo "Attempt $attempt for $src_ref -> $dest_ref"
+              # skopeo copy --all preserves manifest lists and all archs
+              if skopeo copy --all ${SRC_CREDS} ${DEST_CREDS} "$src_ref" "$dest_ref"; then
+                echo "Successfully copied $src -> ${ALIYUN_REGISTRY}/${ALIYUN_NAME_SPACE}/${path_after_registry}"
+                break
+              else
+                echo "skopeo copy failed on attempt $attempt for $src_ref"
+                sleep $((attempt*5))
+              fi
+            done
+
+            if [ $attempt -ge $max_attempts ]; then
+              echo "ERROR: failed to copy $src_ref after $max_attempts attempts"
+              # choose whether to exit or continue. We will continue but mark failure.
+              echo "Continuing to next image (check logs)."
             fi
-            
-            new_image="$ALIYUN_REGISTRY/$ALIYUN_NAME_SPACE/$platform_prefix$name_space_prefix$image_name_tag"
-            echo "docker tag $image $new_image"
-            docker tag $image $new_image
-            echo "docker push $new_image"
-            docker push $new_image
-        done < images.txt
+
+            echo "---- done $n ----"
+          done < images.txt
+
+          echo "All lines processed."
