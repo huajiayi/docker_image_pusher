@@ -1,1 +1,2 @@
-eclipse-temurin:21
+node:23-alpine
+nginx:alpine
