@@ -1,2 +1,1 @@
-node:23-alpine
-nginx:alpine
+jumpserver/jms_all:v4.1.0
